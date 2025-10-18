@@ -1,2 +1,6 @@
 subprojects/disarm
 subprojects/dynasm
+
+# ylitchev: additional ignores
+*~
+
