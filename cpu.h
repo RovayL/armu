@@ -125,6 +125,48 @@ static void update_nzcv(struct Armu* armu, int is_64bit, uint64_t result, uint8_
     armu->flags.v = overflow_out;
 }
 
+static inline void set_flags_from_nzcv(struct Armu* armu, unsigned nzcv) {
+    armu->flags.n = (nzcv >> 3) & 1;
+    armu->flags.z = (nzcv >> 2) & 1;
+    armu->flags.c = (nzcv >> 1) & 1;
+    armu->flags.v = nzcv & 1;
+}
+
+static int condition_passed(const struct Armu* armu, unsigned cond);
+static uint64_t execute_add_with_carry(struct Armu* armu, uint64_t lhs, uint64_t rhs, uint64_t carry_in, int is_64bit, int update_flags);
+
+static inline unsigned extract_condition(const struct Da64Inst* dinst) {
+    for (size_t i = 0; i < sizeof(dinst->ops) / sizeof(dinst->ops[0]); ++i) {
+        if (dinst->ops[i].type == DA_OP_COND) {
+            return dinst->ops[i].cond;
+        }
+    }
+    return DA_AL;
+}
+
+static inline void conditional_compare(struct Armu* armu,
+                                       int is_64bit,
+                                       uint64_t lhs,
+                                       uint64_t operand,
+                                       unsigned cond,
+                                       unsigned nzcv_value,
+                                       int subtract)
+{
+    unsigned width = value_width(is_64bit);
+    lhs = zero_extend_bits(lhs, width);
+    operand = zero_extend_bits(operand, width);
+
+    if (condition_passed(armu, cond)) {
+        if (subtract) {
+            execute_add_with_carry(armu, lhs, ~operand, 1, is_64bit, 1);
+        } else {
+            execute_add_with_carry(armu, lhs, operand, 0, is_64bit, 1);
+        }
+    } else {
+        set_flags_from_nzcv(armu, nzcv_value & 0xf);
+    }
+}
+
 static uint64_t apply_shift_operand(struct Armu* armu, const struct Da64Op* op, int dest_is_64bit) {
     assert(op->type == DA_OP_REGGPEXT);
     int operand_is_64 = op->reggpext.sf;
@@ -709,12 +751,29 @@ subs_shift(struct Armu* armu, struct Da64Inst* dinst)
 static void
 adr(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int64_t offset = (int64_t)dinst->imm64;
+    uint64_t base = armu->pc;
+    uint64_t result = (uint64_t)((int64_t)base + offset);
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 adrp(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
 
+    /* ADRP ignores the low 12 bits of the PC before applying the offset. */
+    uint64_t pc_page = armu->pc & ~UINT64_C(0xfff);
+    int64_t offset = (int64_t)dinst->imm64;
+    uint64_t result = pc_page + (uint64_t)offset;
+
+    /* Result is always 64-bit regardless of encoding width. */
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 and_imm(struct Armu* armu, struct Da64Inst* dinst)
@@ -986,42 +1045,180 @@ rorv(struct Armu* armu, struct Da64Inst* dinst)
 static void
 madd(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_idx = dinst->ops[3].reg;
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t multiplicand = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t multiplier = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    uint64_t addend = get_reg_value(armu, ra_idx, is_64bit, ra_is_sp) & mask;
+
+    __uint128_t product = (__uint128_t)multiplicand * multiplier;
+    uint64_t prod_low = (uint64_t)product & mask;
+    uint64_t result = (prod_low + addend) & mask;
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 msub(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_idx = dinst->ops[3].reg;
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t multiplicand = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t multiplier = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    uint64_t addend = get_reg_value(armu, ra_idx, is_64bit, ra_is_sp) & mask;
+
+    __uint128_t product = (__uint128_t)multiplicand * multiplier;
+    uint64_t prod_low = (uint64_t)product & mask;
+    uint64_t result = (addend - prod_low) & mask;
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 smaddl(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
+    int ra_idx = dinst->ops[3].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    int32_t multiplicand = (int32_t)get_reg_value(armu, rn_idx, 0, rn_is_sp);
+    int32_t multiplier = (int32_t)get_reg_value(armu, rm_idx, 0, rm_is_sp);
+    int64_t addend = (int64_t)get_reg_value(armu, ra_idx, 1, ra_is_sp);
+
+    int64_t product = (int64_t)multiplicand * (int64_t)multiplier;
+    uint64_t result = (uint64_t)(product + addend);
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 smsubl(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
+    int ra_idx = dinst->ops[3].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    int32_t multiplicand = (int32_t)get_reg_value(armu, rn_idx, 0, rn_is_sp);
+    int32_t multiplier = (int32_t)get_reg_value(armu, rm_idx, 0, rm_is_sp);
+    int64_t minuend = (int64_t)get_reg_value(armu, ra_idx, 1, ra_is_sp);
+
+    int64_t product = (int64_t)multiplicand * (int64_t)multiplier;
+    uint64_t result = (uint64_t)(minuend - product);
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 umaddl(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
+    int ra_idx = dinst->ops[3].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    uint32_t multiplicand = (uint32_t)get_reg_value(armu, rn_idx, 0, rn_is_sp);
+    uint32_t multiplier = (uint32_t)get_reg_value(armu, rm_idx, 0, rm_is_sp);
+    uint64_t addend = get_reg_value(armu, ra_idx, 1, ra_is_sp);
+
+    uint64_t product = (uint64_t)multiplicand * (uint64_t)multiplier;
+    uint64_t result = product + addend;
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 umsubl(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
+    int ra_idx = dinst->ops[3].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int ra_is_sp = op_is_sp(&dinst->ops[3]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    uint32_t multiplicand = (uint32_t)get_reg_value(armu, rn_idx, 0, rn_is_sp);
+    uint32_t multiplier = (uint32_t)get_reg_value(armu, rm_idx, 0, rm_is_sp);
+    uint64_t minuend = get_reg_value(armu, ra_idx, 1, ra_is_sp);
+
+    uint64_t product = (uint64_t)multiplicand * (uint64_t)multiplier;
+    uint64_t result = minuend - product;
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 smulh(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    int64_t multiplicand = (int64_t)get_reg_value(armu, rn_idx, 1, rn_is_sp);
+    int64_t multiplier = (int64_t)get_reg_value(armu, rm_idx, 1, rm_is_sp);
+    __int128 product = (__int128)multiplicand * (__int128)multiplier;
+    uint64_t result = (uint64_t)((product >> 64) & UINT64_MAX);
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 umulh(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rn_idx = dinst->ops[1].reg;
+    int rm_idx = dinst->ops[2].reg;
 
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+
+    uint64_t multiplicand = get_reg_value(armu, rn_idx, 1, rn_is_sp);
+    uint64_t multiplier = get_reg_value(armu, rm_idx, 1, rm_is_sp);
+    __uint128_t product = (__uint128_t)multiplicand * (__uint128_t)multiplier;
+    uint64_t result = (uint64_t)(product >> 64);
+
+    set_reg_value(armu, rd_idx, 1, rd_is_sp, result);
 }
 static void
 bcond(struct Armu* armu, struct Da64Inst* dinst)
@@ -1150,57 +1347,237 @@ tbnz(struct Armu* armu, struct Da64Inst* dinst)
 static void
 ccmn_imm(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[0].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[0]);
 
+    uint64_t lhs = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t imm = dinst->ops[1].uimm16;
+    unsigned nzcv = dinst->ops[2].uimm16;
+    unsigned cond = extract_condition(dinst);
+
+    conditional_compare(armu, is_64bit, lhs, imm, cond, nzcv, 0);
 }
 static void
 ccmp_imm(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[0].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[0]);
 
+    uint64_t lhs = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t imm = dinst->ops[1].uimm16;
+    unsigned nzcv = dinst->ops[2].uimm16;
+    unsigned cond = extract_condition(dinst);
+
+    conditional_compare(armu, is_64bit, lhs, imm, cond, nzcv, 1);
 }
 static void
 ccmn_reg(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[0].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[0]);
+    int rm_idx = dinst->ops[1].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[1]);
 
+    uint64_t lhs = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t operand = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp);
+    unsigned nzcv = dinst->ops[2].uimm16;
+    unsigned cond = extract_condition(dinst);
+
+    conditional_compare(armu, is_64bit, lhs, operand, cond, nzcv, 0);
 }
 static void
 ccmp_reg(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[0].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[0]);
+    int rm_idx = dinst->ops[1].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[1]);
 
+    uint64_t lhs = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t operand = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp);
+    unsigned nzcv = dinst->ops[2].uimm16;
+    unsigned cond = extract_condition(dinst);
+
+    conditional_compare(armu, is_64bit, lhs, operand, cond, nzcv, 1);
 }
 static void
 clz(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
 
+    unsigned width = value_width(is_64bit);
+    uint64_t value = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t masked = zero_extend_bits(value, width);
+
+    unsigned result;
+    if (width == 32) {
+        result = masked ? __builtin_clz((uint32_t)masked) : 32u;
+    } else {
+        result = masked ? __builtin_clzll(masked) : 64u;
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 cls(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
 
+    unsigned width = value_width(is_64bit);
+    uint64_t value = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp);
+    uint64_t masked = zero_extend_bits(value, width);
+
+    unsigned result;
+    if (width == 32) {
+        result = __builtin_clrsb((int32_t)(uint32_t)masked);
+    } else {
+        result = __builtin_clrsbll((int64_t)masked);
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 csel(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t true_val = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t false_val = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    unsigned cond = extract_condition(dinst);
+
+    uint64_t result = condition_passed(armu, cond) ? true_val : false_val;
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 csinc(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t true_val = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t false_val = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    unsigned cond = extract_condition(dinst);
+
+    uint64_t result;
+    if (condition_passed(armu, cond)) {
+        result = true_val;
+    } else {
+        result = (false_val + 1) & mask;
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 csinv(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t true_val = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t false_val = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    unsigned cond = extract_condition(dinst);
+
+    uint64_t result;
+    if (condition_passed(armu, cond)) {
+        result = true_val;
+    } else {
+        result = (~false_val) & mask;
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 csneg(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t true_val = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t false_val = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+    unsigned cond = extract_condition(dinst);
+
+    uint64_t result;
+    if (condition_passed(armu, cond)) {
+        result = true_val;
+    } else {
+        result = ((~false_val) + 1) & mask;
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 extr(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+    unsigned shift = dinst->ops[3].uimm16;
+
+    unsigned width = value_width(is_64bit);
+    shift &= (width - 1);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t hi = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t lo = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+
+    __uint128_t concat = ((__uint128_t)hi << width) | lo;
+    uint64_t result = (uint64_t)((concat >> shift) & mask);
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 
 // Implementation for MOVZ (Move Wide with Zero)
@@ -1279,12 +1656,60 @@ rev64(struct Armu* armu, struct Da64Inst* dinst)
 static void
 udiv(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    unsigned width = value_width(is_64bit);
+    uint64_t mask = mask_for_width(width);
+
+    uint64_t dividend = get_reg_value(armu, rn_idx, is_64bit, rn_is_sp) & mask;
+    uint64_t divisor = get_reg_value(armu, rm_idx, is_64bit, rm_is_sp) & mask;
+
+    uint64_t result = 0;
+    if (divisor != 0) {
+        if (is_64bit) {
+            result = dividend / divisor;
+        } else {
+            result = (uint32_t)((uint32_t)dividend / (uint32_t)divisor);
+        }
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 sdiv(struct Armu* armu, struct Da64Inst* dinst)
 {
+    int rd_idx = dinst->ops[0].reg;
+    int rd_is_sp = op_is_sp(&dinst->ops[0]);
+    int is_64bit = dinst->ops[0].reggp.sf;
 
+    int rn_idx = dinst->ops[1].reg;
+    int rn_is_sp = op_is_sp(&dinst->ops[1]);
+    int rm_idx = dinst->ops[2].reg;
+    int rm_is_sp = op_is_sp(&dinst->ops[2]);
+
+    uint64_t result = 0;
+    if (is_64bit) {
+        int64_t dividend = (int64_t)get_reg_value(armu, rn_idx, 1, rn_is_sp);
+        int64_t divisor = (int64_t)get_reg_value(armu, rm_idx, 1, rm_is_sp);
+        if (divisor != 0) {
+            result = (uint64_t)(dividend / divisor);
+        }
+    } else {
+        int32_t dividend = (int32_t)get_reg_value(armu, rn_idx, 0, rn_is_sp);
+        int32_t divisor = (int32_t)get_reg_value(armu, rm_idx, 0, rm_is_sp);
+        if (divisor != 0) {
+            result = (uint32_t)(dividend / divisor);
+        }
+    }
+
+    set_reg_value(armu, rd_idx, is_64bit, rd_is_sp, result);
 }
 static void
 stpw_post(struct Armu* armu, struct Da64Inst* dinst)

@@ -204,6 +204,75 @@ armu_run(struct Armu* armu)
         case DA64I_RORV:
             rorv(armu, &dinst);
             break;
+        case DA64I_ADR:
+            adr(armu, &dinst);
+            break;
+        case DA64I_ADRP:
+            adrp(armu, &dinst);
+            break;
+        case DA64I_MADD:
+            madd(armu, &dinst);
+            break;
+        case DA64I_MSUB:
+            msub(armu, &dinst);
+            break;
+        case DA64I_SMADDL:
+            smaddl(armu, &dinst);
+            break;
+        case DA64I_SMSUBL:
+            smsubl(armu, &dinst);
+            break;
+        case DA64I_UMADDL:
+            umaddl(armu, &dinst);
+            break;
+        case DA64I_UMSUBL:
+            umsubl(armu, &dinst);
+            break;
+        case DA64I_SMULH:
+            smulh(armu, &dinst);
+            break;
+        case DA64I_UMULH:
+            umulh(armu, &dinst);
+            break;
+        case DA64I_CCMN_IMM:
+            ccmn_imm(armu, &dinst);
+            break;
+        case DA64I_CCMP_IMM:
+            ccmp_imm(armu, &dinst);
+            break;
+        case DA64I_CCMN_REG:
+            ccmn_reg(armu, &dinst);
+            break;
+        case DA64I_CCMP_REG:
+            ccmp_reg(armu, &dinst);
+            break;
+        case DA64I_CLZ:
+            clz(armu, &dinst);
+            break;
+        case DA64I_CLS:
+            cls(armu, &dinst);
+            break;
+        case DA64I_CSEL:
+            csel(armu, &dinst);
+            break;
+        case DA64I_CSINC:
+            csinc(armu, &dinst);
+            break;
+        case DA64I_CSINV:
+            csinv(armu, &dinst);
+            break;
+        case DA64I_CSNEG:
+            csneg(armu, &dinst);
+            break;
+        case DA64I_EXTR:
+            extr(armu, &dinst);
+            break;
+        case DA64I_UDIV:
+            udiv(armu, &dinst);
+            break;
+        case DA64I_SDIV:
+            sdiv(armu, &dinst);
+            break;
         case DA64I_STURX:
             sturx(armu, &dinst);
             break;
